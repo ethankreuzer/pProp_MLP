@@ -1,0 +1,8 @@
+# Runtime artifacts from src/make_splits.py
+data/cache/
+data/split_*/
+
+# Python
+__pycache__/
+*.egg-info/
+.venv/

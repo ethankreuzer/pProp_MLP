@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pProp_NN"
+version = "0.1.0"
+description = "Nerual Net for predicting pProps"
+authors = [{name = "Ethan"}]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pandas",
+    "torch>=2.0",
+    "pytorch-lightning>=2.0",
+    "torchmetrics>=0.11",
+    "wandb>=0.13",
+    "scikit-learn",
+    "scipy",
+    "rdkit",
+    "datamol",
+    "pyyaml",
+    "accelerate",
+    "tqdm",
+    "matplotlib",
+    "seaborn",
+    "anndata>=0.10.9",
+    "scanpy>=1.10.3",
+    "leidenalg>=0.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "ipython",
+]
+
+[tool.setuptools]
+packages = []
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
