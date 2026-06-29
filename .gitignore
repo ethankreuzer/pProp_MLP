@@ -6,3 +6,8 @@ data/split_*/
 __pycache__/
 *.egg-info/
 .venv/
+.venv_minimol/
+
+# Sweep / training artifacts
+runs/
+wandb/

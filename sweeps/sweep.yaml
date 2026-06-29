@@ -1,0 +1,68 @@
+# Bayesian hyperparameter sweep for the pProp MLP classifier.
+#
+# Objective: maximize the BEST validation MACRO average precision achieved during
+# a run (best epoch, not the last) -- the unweighted mean AP across all 6 pProp
+# classes, so rare high-pProp classes count equally. sweep_train.py logs it as
+# `best_val_macro_ap` (running max); weighted AP is still tracked for reference.
+#
+# Create + launch:
+#   .venv/bin/wandb sweep sweeps/sweep.yaml          # prints a SWEEP_ID
+#   .venv/bin/wandb agent <ENTITY>/pprop-mlp-minimol/<SWEEP_ID>
+# Run several agents (one per GPU) by exporting CUDA_VISIBLE_DEVICES before each.
+#
+# The ranges below are deliberately broad placeholders -- tune them later.
+
+program: src/sweep_train.py
+method: bayes
+project: pprop-mlp-minimol
+
+metric:
+  name: best_val_macro_ap
+  goal: maximize
+
+# Use the project venv's python and forward sweep params as CLI args.
+command:
+  - ${env}
+  - /home/ethan2/pProp_MLP/.venv/bin/python
+  - ${program}
+  - ${args}
+
+parameters:
+  # --- tuned hyperparameters (broad placeholder ranges) ---
+  n_layers:
+    values: [1, 2, 3, 4, 5]
+  hidden_dim:
+    distribution: q_log_uniform_values
+    min: 16
+    max: 512
+  init_lr:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.01
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.05
+  dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.5
+  batch_size:
+    distribution: q_log_uniform_values
+    min: 2
+    max: 128
+  epochs:
+    distribution: q_log_uniform_values
+    min: 10
+    max: 150
+
+  # Loss is always weighted cross-entropy with inverse-class-frequency weights
+  # (computed from the train split); no loss hyperparameters to sweep.
+
+  # --- constants (recorded with every run) ---
+  split_dir:
+    value: data/split_3
+  patience:
+    value: 40
+  eta_min:
+    value: 0.00000001   # cosine schedule floor = 1e-8

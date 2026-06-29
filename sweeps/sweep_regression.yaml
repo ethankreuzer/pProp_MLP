@@ -1,0 +1,59 @@
+# Bayesian hyperparameter sweep for the pProp MLP regression model.
+#
+# Identical to sweep.yaml except the program is sweep_train_regression.py.
+# The model predicts pProp as a continuous scalar (MSE loss); per-class AUC/AP
+# are computed via soft scores (negative distance to bin boundary) so that
+# `best_val_macro_ap` is directly comparable to the classification sweep runs.
+#
+# Create + launch:
+#   .venv/bin/wandb sweep sweeps/sweep_regression.yaml   # prints a SWEEP_ID
+#   SWEEP_ID=<id> sbatch launch_sweep_regression.sh
+
+program: src/sweep_train_regression.py
+method: bayes
+project: pprop-mlp-minimol
+
+metric:
+  name: best_val_macro_ap
+  goal: maximize
+
+command:
+  - ${env}
+  - /home/ethan2/pProp_MLP/.venv/bin/python
+  - ${program}
+  - ${args}
+
+parameters:
+  n_layers:
+    values: [1, 2, 3, 4, 5]
+  hidden_dim:
+    distribution: q_log_uniform_values
+    min: 16
+    max: 512
+  init_lr:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.01
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.05
+  dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.5
+  batch_size:
+    distribution: q_log_uniform_values
+    min: 2
+    max: 128
+  epochs:
+    distribution: q_log_uniform_values
+    min: 10
+    max: 150
+
+  split_dir:
+    value: data/split_3
+  patience:
+    value: 40
+  eta_min:
+    value: 0.00000001
