@@ -48,53 +48,101 @@ def _spearman(x, y, w):
     return _weighted_pearson(rankdata(x), rankdata(y), w)
 
 
-def compute_correlation_metrics(y_true_pprop, pred_pprop, true_class_idx,
-                                sample_weights, class_names):
+def _two_group_weights(y_true_pprop, group_edge):
+    """
+    Split molecules into a low group [pProp < group_edge) and a high group
+    [pProp >= group_edge) by TRUE pProp, and return inverse-group-frequency
+    weights (w = N / (2 * n_group), mean 1) so the two groups contribute equally.
+
+    Returns (weights (N,), high_group_mask (N,) bool). Weights are all-ones if
+    either group is empty.
+    """
+    y = np.asarray(y_true_pprop, dtype=np.float64)
+    n = len(y)
+    ge = y >= group_edge
+    n_ge = int(ge.sum())
+    n_lt = n - n_ge
+    w = np.ones(n, dtype=np.float64)
+    if n_lt > 0 and n_ge > 0:
+        w[~ge] = n / (2.0 * n_lt)
+        w[ge] = n / (2.0 * n_ge)
+    return w, ge
+
+
+def compute_correlation_metrics(y_true_pprop, pred_pprop, group_edge=5.0):
     """
     Pearson / Spearman correlation between predicted and true pProp.
 
-    Computes, for both train and val callers:
-      - whole-set, UNWEIGHTED  (`pearson`, `spearman`)
-      - whole-set, WEIGHTED by `sample_weights` (`pearson_weighted`,
-        `spearman_weighted`) — same inverse-class-frequency per-sample weights as
-        the loss, so the rare high-pProp classes count comparably.
-      - per-subclass, unweighted (`pearson_by_class[name]`,
-        `spearman_by_class[name]`): correlation among molecules whose TRUE pProp
-        falls in that bin. (Weighting within one class is meaningless, so these
-        are unweighted.)
+    Molecules are split into two groups by their TRUE pProp: a low group
+    [pProp < group_edge) and a high group [pProp >= group_edge). Reported, for
+    both train and val callers:
+      - whole set, UNWEIGHTED  (`pearson`, `spearman`)
+      - whole set, WEIGHTED so the two groups contribute equally: each molecule's
+        weight is inversely proportional to its group's size,
+        w = N / (2 * n_group), normalized to mean 1. This upweights the smaller
+        high-pProp group. (`pearson_weighted`, `spearman_weighted`)
+      - each group separately, unweighted: low group (`*_group_lt`) and high group
+        (`*_group_ge`). These two groups span wide pProp ranges, so they avoid the
+        range-restriction artifact that makes narrow per-bin correlations
+        unreliable.
 
     Parameters
     ----------
-    y_true_pprop   : (N,) true continuous pProp values
-    pred_pprop     : (N,) predicted pProp values
-    true_class_idx : (N,) int class index of each molecule's true pProp bin
-    sample_weights : (N,) per-sample weights for the weighted whole-set values
-    class_names    : list[str] length C
+    y_true_pprop : (N,) true continuous pProp values
+    pred_pprop   : (N,) predicted pProp values
+    group_edge   : pProp boundary splitting the low/high groups (default 5.0)
 
-    Returns a dict (per-class entries are np.nan when a bin has < 2 members or no
-    variance).
+    Returns a dict; any value is np.nan when its subset has < 2 points or no
+    variance.
     """
     y = np.asarray(y_true_pprop, dtype=np.float64)
     p = np.asarray(pred_pprop, dtype=np.float64)
-    w = np.asarray(sample_weights, dtype=np.float64)
-    true_class_idx = np.asarray(true_class_idx)
-    ones = np.ones_like(y)
-
-    out = {
+    w, ge = _two_group_weights(y, group_edge)
+    ones = np.ones(len(y), dtype=np.float64)
+    return {
         "pearson": _pearson(y, p, ones),
         "spearman": _spearman(y, p, ones),
         "pearson_weighted": _pearson(y, p, w),
         "spearman_weighted": _spearman(y, p, w),
-        "pearson_by_class": {},
-        "spearman_by_class": {},
+        "pearson_group_lt": _pearson(y[~ge], p[~ge], ones[~ge]),
+        "spearman_group_lt": _spearman(y[~ge], p[~ge], ones[~ge]),
+        "pearson_group_ge": _pearson(y[ge], p[ge], ones[ge]),
+        "spearman_group_ge": _spearman(y[ge], p[ge], ones[ge]),
+        "group_edge": group_edge,
     }
-    for c, name in enumerate(class_names):
-        mask = true_class_idx == c
-        yc, pc = y[mask], p[mask]
-        oc = np.ones_like(yc)
-        out["pearson_by_class"][name] = _pearson(yc, pc, oc)
-        out["spearman_by_class"][name] = _spearman(yc, pc, oc)
-    return out
+
+
+def compute_error_metrics(y_true_pprop, pred_pprop, group_edge=5.0):
+    """
+    Mean Absolute Error between predicted and true pProp.
+
+    MAE (not MSE) is reported as the standalone error metric because the eval
+    loss already IS the MSE; MAE adds a robust, pProp-unit "typical miss" that
+    isn't dominated by the rare high-pProp tail. Mirrors the correlation layout:
+      - whole set, UNWEIGHTED (`mae`)
+      - whole set, WEIGHTED by inverse group size so the low [<edge) and high
+        [>=edge) groups count equally (`mae_weighted`)
+      - each group, unweighted (`mae_group_lt`, `mae_group_ge`)
+
+    Returns a dict; any value is np.nan when its subset is empty.
+    """
+    y = np.asarray(y_true_pprop, dtype=np.float64)
+    p = np.asarray(pred_pprop, dtype=np.float64)
+    err = np.abs(p - y)
+    w, ge = _two_group_weights(y, group_edge)
+
+    def _mae(mask):
+        e = err[mask]
+        return float(e.mean()) if e.size else np.nan
+
+    full = slice(None)
+    return {
+        "mae": _mae(full),
+        "mae_weighted": float((w * err).sum() / w.sum()) if w.sum() > 0 else np.nan,
+        "mae_group_lt": _mae(~ge),
+        "mae_group_ge": _mae(ge),
+        "group_edge": group_edge,
+    }
 
 
 def enrichment_factor(y_true_pprop, scores, thresholds, fractions):

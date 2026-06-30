@@ -446,7 +446,7 @@ def main():
     ap.add_argument("--csv", type=str, default=None)
     ap.add_argument("--cache-dir", type=str, default=None)
     ap.add_argument("--out-parent", type=str, default=None)
-    ap.add_argument("--ceiling", type=float, default=0.70,
+    ap.add_argument("--ceiling", type=float, default=0.65,
                     help="target max Tanimoto of a val molecule to train (guaranteed where feasible)")
     ap.add_argument("--val-frac", type=float, default=0.125,
                     help="fraction of EACH class held out to val")

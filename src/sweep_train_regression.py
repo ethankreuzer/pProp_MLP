@@ -32,6 +32,7 @@ from data_utils import CACHE_DIR, CLASS_EDGES, CLASS_NAMES
 from losses import inverse_frequency_weights, sample_weights_from_classes, weighted_mse_loss
 from metrics import (
     compute_correlation_metrics,
+    compute_error_metrics,
     compute_regression_metrics,
     enrichment_factor,
 )
@@ -46,6 +47,12 @@ N_CLASSES = len(CLASS_NAMES)
 # each at the top 1% of the model-ranked list (predicted pProp = ranking score).
 EF_THRESHOLDS = [4.0, 4.5, 5.0, 5.5, 6.0]
 EF_FRACTIONS = [0.01]
+
+# Pearson/Spearman correlations split molecules into two groups by TRUE pProp:
+# [pProp < edge) and [pProp >= edge). Wide groups avoid per-bin range restriction.
+CORR_GROUP_EDGE = 5.0
+CORR_GROUP_LT = f"0-{CORR_GROUP_EDGE:g}"   # low group label, e.g. "0-5"
+CORR_GROUP_GE = f"{CORR_GROUP_EDGE:g}+"    # high group label, e.g. "5+"
 
 
 def _fmt_thr(thr):
@@ -102,21 +109,20 @@ def load_data(split_dir, device):
 
 
 @torch.no_grad()
-def evaluate(model, X, pprop_true, y_class, class_weights, class_names):
+def evaluate(model, X, pprop_true, class_names):
     """Full-set unweighted MSE + regression metrics in eval mode (no dropout)."""
     model.eval()
     pred = model(X).squeeze(-1)
     loss = F.mse_loss(pred, pprop_true).item()
     pred_np = pred.cpu().numpy()
     pprop_np = pprop_true.cpu().numpy()
-    y_np = y_class.cpu().numpy()
-    # Per-sample weights (inverse class frequency) for the weighted correlations.
-    sample_w = sample_weights_from_classes(y_class, class_weights).cpu().numpy()
     m = compute_regression_metrics(pprop_np, pred_np, CLASS_EDGES, class_names)
     # Rank by predicted pProp (higher = predicted more elite) for enrichment.
     m["enrichment"] = enrichment_factor(pprop_np, pred_np, EF_THRESHOLDS, EF_FRACTIONS)
-    m["correlation"] = compute_correlation_metrics(
-        pprop_np, pred_np, y_np, sample_w, class_names)
+    # Pearson/Spearman; weighting + two-group split derive from true pProp only.
+    m["correlation"] = compute_correlation_metrics(pprop_np, pred_np, CORR_GROUP_EDGE)
+    # MAE (robust complement to the MSE loss), same two-group layout.
+    m["error"] = compute_error_metrics(pprop_np, pred_np, CORR_GROUP_EDGE)
     m["loss"] = loss
     return m
 
@@ -141,9 +147,15 @@ def log_dict(split, m, class_names):
     out[f"{split}/pearson_weighted"] = c["pearson_weighted"]
     out[f"{split}/spearman_unweighted"] = c["spearman"]
     out[f"{split}/spearman_weighted"] = c["spearman_weighted"]
-    for name in class_names:
-        out[f"{split}/pearson/pprop_{name}"] = c["pearson_by_class"][name]
-        out[f"{split}/spearman/pprop_{name}"] = c["spearman_by_class"][name]
+    out[f"{split}/pearson/pprop{CORR_GROUP_LT}"] = c["pearson_group_lt"]
+    out[f"{split}/pearson/pprop{CORR_GROUP_GE}"] = c["pearson_group_ge"]
+    out[f"{split}/spearman/pprop{CORR_GROUP_LT}"] = c["spearman_group_lt"]
+    out[f"{split}/spearman/pprop{CORR_GROUP_GE}"] = c["spearman_group_ge"]
+    e = m["error"]
+    out[f"{split}/mae_unweighted"] = e["mae"]
+    out[f"{split}/mae_weighted"] = e["mae_weighted"]
+    out[f"{split}/mae/pprop{CORR_GROUP_LT}"] = e["mae_group_lt"]
+    out[f"{split}/mae/pprop{CORR_GROUP_GE}"] = e["mae_group_ge"]
     return out
 
 
@@ -171,7 +183,7 @@ def main():
     class_names = data["class_names"]
     X_train, y_train = data["X_train"], data["y_train"]
     pprop_train = data["pprop_train"]
-    X_val, y_val, pprop_val = data["X_val"], data["y_val"], data["pprop_val"]
+    X_val, pprop_val = data["X_val"], data["pprop_val"]
 
     # Single scalar output — no softmax; raw pProp prediction.
     model = MLP(
@@ -205,6 +217,7 @@ def main():
     best_val_weighted_ap = -1.0
     best_val_enrichment = {}  # val EF dict captured at the best epoch
     best_val_correlation = {}  # val correlation dict captured at the best epoch
+    best_val_error = {}  # val MAE dict captured at the best epoch
     best_epoch = -1
     epochs_no_improve = 0
     n_train = X_train.shape[0]
@@ -221,8 +234,8 @@ def main():
             optimizer.step()
         scheduler.step()
 
-        train_m = evaluate(model, X_train, pprop_train, y_train, class_weights, class_names)
-        val_m = evaluate(model, X_val, pprop_val, y_val, class_weights, class_names)
+        train_m = evaluate(model, X_train, pprop_train, class_names)
+        val_m = evaluate(model, X_val, pprop_val, class_names)
 
         best_train_macro_ap = max(best_train_macro_ap, train_m["macro_ap"])
         best_val_weighted_ap = max(best_val_weighted_ap, val_m["weighted_ap"])
@@ -233,6 +246,7 @@ def main():
             best_val_macro_ap = val_macro_ap
             best_val_enrichment = val_m["enrichment"]
             best_val_correlation = val_m["correlation"]
+            best_val_error = val_m["error"]
             best_epoch = epoch
             epochs_no_improve = 0
             torch.save(
@@ -276,14 +290,28 @@ def main():
     }
     for k, v in best_ef_flat.items():
         wandb.summary[k] = v
-    # Whole-set val correlations at the selected (best) epoch -> summary columns.
+    # Val correlations at the selected (best) epoch -> summary columns.
     best_corr_flat = {
         "best_val_pearson_unweighted": best_val_correlation.get("pearson"),
         "best_val_pearson_weighted": best_val_correlation.get("pearson_weighted"),
         "best_val_spearman_unweighted": best_val_correlation.get("spearman"),
         "best_val_spearman_weighted": best_val_correlation.get("spearman_weighted"),
+        f"best_val_pearson_pprop{CORR_GROUP_LT}": best_val_correlation.get("pearson_group_lt"),
+        f"best_val_pearson_pprop{CORR_GROUP_GE}": best_val_correlation.get("pearson_group_ge"),
+        f"best_val_spearman_pprop{CORR_GROUP_LT}": best_val_correlation.get("spearman_group_lt"),
+        f"best_val_spearman_pprop{CORR_GROUP_GE}": best_val_correlation.get("spearman_group_ge"),
     }
     for k, v in best_corr_flat.items():
+        if v is not None:
+            wandb.summary[k] = v
+    # Val MAE at the selected (best) epoch -> summary columns.
+    best_mae_flat = {
+        "best_val_mae_unweighted": best_val_error.get("mae"),
+        "best_val_mae_weighted": best_val_error.get("mae_weighted"),
+        f"best_val_mae_pprop{CORR_GROUP_LT}": best_val_error.get("mae_group_lt"),
+        f"best_val_mae_pprop{CORR_GROUP_GE}": best_val_error.get("mae_group_ge"),
+    }
+    for k, v in best_mae_flat.items():
         if v is not None:
             wandb.summary[k] = v
     wandb.save(str(ckpt_path))
@@ -293,6 +321,7 @@ def main():
          "best_val_weighted_ap": best_val_weighted_ap,
          "best_val_enrichment": best_ef_flat,
          "best_val_correlation": best_val_correlation,
+         "best_val_error": best_val_error,
          "best_epoch": best_epoch,
          "run_id": wandb.run.id, "config": cfg_dict}, indent=2))
     print(f"Done. Best val macro AP {best_val_macro_ap:.4f} @ epoch {best_epoch}. "
