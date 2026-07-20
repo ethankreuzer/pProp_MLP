@@ -3,6 +3,7 @@ data/cache/
 data/split_*/
 plots/
 # Large dataset variants (kept local only)
+data/ampc_subset.csv
 data/ampc_subset_200k.csv
 data/ampc_subset_without_0to0p5.csv
 # Python
