@@ -115,6 +115,23 @@ Expect `in_dim=2560` in the wandb config and a `final_model.pt` tagged
 
 ## Status
 
-No model change has been made. The plan is to run the MiniMol-only sweep, then a
-separate sweep with MiniMol+ECFP pinned on. The architecture question above is
-reopened only if ECFP underperforms *with its own hyperparameters selected*.
+**On the `minimol-ecfp-twotower` branch the two-tower rewrite above is now
+implemented** (`model.TwoTowerDualHeadMLP`): MiniMol and ECFP are each projected
+(`Linear→LN→ReLU`) and concatenated before the shared trunk. One deviation from the
+sketch: the two projection widths are **independent** swept hyperparameters
+(`proj_dim_minimol`, `proj_dim_ecfp`) rather than a single common `h`. This is
+deliberate — it lets the sweep explore unequal per-tower capacity — at the cost that
+bayes *may* pick unequal widths that partially reintroduce the dimension imbalance a
+common `h` would eliminate by construction. The `in_dim`-only checkpoint contract is
+replaced for these runs: the checkpoint stores an `arch="two_tower"` tag plus
+`minimol_dim`/`ecfp_dim`/`proj_dim_*`, and `load_checkpoint` dispatches on that tag.
+
+The branch also makes the **ECFP Morgan radius sweepable** (`ecfp_radius ∈ {2,3,4}`).
+Because radius can't be varied through make_splits' single r2 cache, ECFP is
+precomputed per-radius up front by `src/featurize_ecfp.py` into self-contained
+`ecfp_r{r}_b{nbits}.npy` caches, loaded via `data_utils.load_ecfp_precomputed`.
+
+The main branch is unchanged: it still runs the MiniMol-only sweep and (optionally) a
+separate pinned MiniMol+ECFP *concat* sweep. The two-tower branch is the architectural
+answer to "does ECFP help once it's on a comparable scale and given its own
+hyperparameters", now testable directly.

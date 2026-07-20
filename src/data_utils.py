@@ -143,6 +143,41 @@ def load_ecfp_features(radius=FP_RADIUS, n_bits=FP_NBITS):
     return features, smiles_index
 
 
+def load_ecfp_precomputed(radius, n_bits=FP_NBITS):
+    """
+    ECFP feature block from a per-radius cache written by src/featurize_ecfp.py.
+
+    Unlike load_ecfp_features (which reuses make_splits' single r2/b2048 cache in
+    CSV-row order), this reads a self-contained, unique-molecule-order cache so the
+    two-tower branch can SWEEP the Morgan radius: ecfp_r{radius}_b{n_bits}.npy
+    (bit-packed uint8) + ecfp_r{radius}_b{n_bits}_smiles.txt (aligned canonical
+    SMILES). Both are produced together, so no scaffolds.pkl / valid.npy coupling.
+
+    Returns (features, smiles_index): features[i] is the ECFP of smiles_index[i] --
+    the same (matrix, aligned-canonical-SMILES) shape build_split_arrays expects, so
+    it passes straight through as an extra feature block alongside MiniMol.
+    """
+    fps_path = CACHE_DIR / f"ecfp_r{radius}_b{n_bits}.npy"
+    smi_path = CACHE_DIR / f"ecfp_r{radius}_b{n_bits}_smiles.txt"
+    for p in (fps_path, smi_path):
+        if not p.exists():
+            raise FileNotFoundError(
+                f"{p} not found; precompute ECFP for radius {radius} first with "
+                f"`.venv/bin/python src/featurize_ecfp.py --radii {radius}`."
+            )
+
+    packed = np.load(fps_path)                       # (M, n_bits//8) uint8
+    smiles_index = smi_path.read_text().splitlines()
+    if len(packed) != len(smiles_index):
+        raise ValueError(
+            f"ECFP cache row mismatch for radius {radius}: fps={len(packed)}, "
+            f"smiles={len(smiles_index)}. Recompute with "
+            f"`src/featurize_ecfp.py --radii {radius} --force`."
+        )
+    features = np.unpackbits(packed, axis=1)[:, :n_bits].astype(np.float32)
+    return features, smiles_index
+
+
 def read_smi(path):
     """Read a .smi file (one SMILES per line) -> list[str]."""
     lines = Path(path).read_text().splitlines()

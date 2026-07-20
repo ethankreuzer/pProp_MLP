@@ -55,6 +55,19 @@ feature sets with two separate equal-budget sweeps (`[0]` and `[1]`) so the ECFP
 can select its own weight decay. Full reasoning + the proposed two-tower fix (if ever
 needed): `docs/ecfp_concat.md`.
 
+> **Branch `minimol-ecfp-twotower`.** That two-tower fix is implemented on this
+> branch: `model.TwoTowerDualHeadMLP` projects MiniMol and ECFP *separately*
+> (`Linear→LN→ReLU`) then concatenates before the trunk, with **independent swept
+> projection widths** `proj_dim_minimol` / `proj_dim_ecfp`. It also makes the ECFP
+> **Morgan radius sweepable** (`ecfp_radius ∈ {2,3,4}`): ECFP is precomputed
+> per-radius by `src/featurize_ecfp.py` → `data/cache/ecfp_r{r}_b{nbits}.npy`, loaded
+> via `data_utils.load_ecfp_precomputed` (not the main-branch `load_ecfp_features`).
+> `use_ecfp` is pinned `[1]` in `sweeps/sweep.yaml`, project
+> `pprop-mlp-minimol-ecfp-twotower`. Checkpoints carry `arch="two_tower"` +
+> `minimol_dim`/`ecfp_dim`/`proj_dim_*`, and `load_checkpoint` dispatches on that tag.
+> **Precompute every swept radius before launching** (`src/featurize_ecfp.py --radii
+> 2 3 4`), or runs sampling a missing radius crash at load.
+
 **Optional target normalization.** `--pprop_norm {none,zscore,minmax}` (default
 `none`) makes the **regression head predict a normalized pProp** instead of raw
 pProp (`src/normalization.py`). Stats come from the **train split only**: `zscore` =

@@ -67,7 +67,7 @@ from metrics import (
     compute_class_pearson_metrics,
     compute_metrics,
 )
-from model import DualHeadMLP
+from model import DualHeadMLP, TwoTowerDualHeadMLP
 from normalization import compute_norm_stats, denormalize_pprop, normalize_pprop
 
 EMB_PATH = CACHE_DIR / "minimol_embeddings.npy"
@@ -87,7 +87,18 @@ def parse_args():
     # int-valued (0/1) rather than store_true so it drops into sweep.yaml as
     # `values: [0, 1]` for a single MiniMol-vs-MiniMol+ECFP comparison sweep.
     ap.add_argument("--use_ecfp", type=int, default=0, choices=(0, 1),
-                    help="1 = concat cached ECFP (2048-d) onto MiniMol; 0 = MiniMol only.")
+                    help="1 = add the ECFP tower alongside MiniMol; 0 = MiniMol only.")
+    # two-tower ECFP input: each block is projected separately (Linear->LN->ReLU)
+    # then concatenated (see model.TwoTowerDualHeadMLP / docs/ecfp_concat.md).
+    ap.add_argument("--proj_dim_minimol", type=int, default=256,
+                    help="Projection width of the MiniMol tower.")
+    ap.add_argument("--proj_dim_ecfp", type=int, default=256,
+                    help="Projection width of the ECFP tower (ignored if use_ecfp=0).")
+    ap.add_argument("--ecfp_radius", type=int, default=2,
+                    help="Morgan radius of the precomputed ECFP cache to load "
+                         "(must exist: src/featurize_ecfp.py --radii ...).")
+    ap.add_argument("--ecfp_nbits", type=int, default=2048,
+                    help="Morgan fingerprint bit length of the ECFP cache to load.")
     # regression target normalization (train-set stats). "none" reproduces the
     # pre-normalization behavior byte-for-byte; swept like use_ecfp in sweep.yaml.
     ap.add_argument("--pprop_norm", default="none",
@@ -122,9 +133,13 @@ def parse_args():
     return ap.parse_args()
 
 
-def load_data(split_dir, device, use_ecfp=False):
-    """Load cached embeddings (+ optional ECFP) + a split into GPU tensors."""
-    from data_utils import build_split_arrays, load_ecfp_features
+def load_data(split_dir, device, use_ecfp=False, ecfp_radius=2, ecfp_nbits=2048):
+    """Load cached embeddings (+ optional per-radius ECFP) + a split into GPU tensors.
+
+    Returns minimol_dim / ecfp_dim (the split point in the concatenated X) so the
+    two-tower model can slice the two blocks apart. ecfp_dim is 0 when use_ecfp=0.
+    """
+    from data_utils import build_split_arrays, load_ecfp_precomputed
 
     if not EMB_PATH.exists():
         raise FileNotFoundError(
@@ -133,10 +148,14 @@ def load_data(split_dir, device, use_ecfp=False):
         )
     embeddings = np.load(EMB_PATH)
     smiles_index = SMI_PATH.read_text().splitlines()
-    extra_features = [load_ecfp_features()] if use_ecfp else None
+    minimol_dim = embeddings.shape[1]
+    extra_features = (
+        [load_ecfp_precomputed(ecfp_radius, ecfp_nbits)] if use_ecfp else None
+    )
     data = build_split_arrays(split_dir, embeddings, smiles_index,
                               return_pprop=True, extra_features=extra_features)
 
+    in_dim = data["X_train"].shape[1]
     t = lambda a, dt: torch.as_tensor(a, dtype=dt, device=device)
     return {
         "X_train": t(data["X_train"], torch.float32),
@@ -146,7 +165,9 @@ def load_data(split_dir, device, use_ecfp=False):
         "y_val": t(data["y_val"], torch.long),
         "pprop_val": t(data["pprop_val"], torch.float32),
         "class_names": data["class_names"],
-        "in_dim": data["X_train"].shape[1],
+        "in_dim": in_dim,
+        "minimol_dim": minimol_dim,
+        "ecfp_dim": in_dim - minimol_dim,
     }
 
 
@@ -297,6 +318,8 @@ def main():
     defaults = dict(
         split_dir=args.split_dir, seed=args.seed, use_ecfp=args.use_ecfp,
         pprop_norm=args.pprop_norm,
+        proj_dim_minimol=args.proj_dim_minimol, proj_dim_ecfp=args.proj_dim_ecfp,
+        ecfp_radius=args.ecfp_radius, ecfp_nbits=args.ecfp_nbits,
         n_layers=args.n_layers, hidden_dim=args.hidden_dim,
         cls_n_layers=args.cls_n_layers, cls_hidden_dim=args.cls_hidden_dim,
         reg_n_layers=args.reg_n_layers, reg_hidden_dim=args.reg_hidden_dim,
@@ -312,7 +335,8 @@ def main():
     wandb.define_metric("epoch")
     wandb.define_metric("*", step_metric="epoch")
 
-    data = load_data(cfg.split_dir, device, use_ecfp=bool(cfg.use_ecfp))
+    data = load_data(cfg.split_dir, device, use_ecfp=bool(cfg.use_ecfp),
+                     ecfp_radius=cfg.ecfp_radius, ecfp_nbits=cfg.ecfp_nbits)
     class_names = data["class_names"]
     X_train, y_train, pprop_train = data["X_train"], data["y_train"], data["pprop_train"]
     X_val, y_val, pprop_val = data["X_val"], data["y_val"], data["pprop_val"]
@@ -326,8 +350,11 @@ def main():
     pprop_train_norm = normalize_pprop(pprop_train, norm_stats)
     pprop_val_norm = normalize_pprop(pprop_val, norm_stats)
 
-    model = DualHeadMLP(
-        in_dim=data["in_dim"],
+    model = TwoTowerDualHeadMLP(
+        minimol_dim=data["minimol_dim"],
+        ecfp_dim=data["ecfp_dim"],
+        proj_dim_minimol=cfg.proj_dim_minimol,
+        proj_dim_ecfp=cfg.proj_dim_ecfp,
         hidden_dim=cfg.hidden_dim,
         n_layers=cfg.n_layers,
         dropout=cfg.dropout,
@@ -338,7 +365,9 @@ def main():
         n_classes=n_classes,
     ).to(device)
     wandb.config.update(
-        {"in_dim": data["in_dim"], "n_classes": n_classes, "task": "dual"},
+        {"in_dim": data["in_dim"], "minimol_dim": data["minimol_dim"],
+         "ecfp_dim": data["ecfp_dim"], "n_classes": n_classes,
+         "task": "dual", "arch": "two_tower"},
         allow_val_change=True,
     )
 
@@ -408,8 +437,13 @@ def main():
             "config": cfg_dict,
             "class_names": class_names,
             "in_dim": data["in_dim"],
+            "minimol_dim": data["minimol_dim"],
+            "ecfp_dim": data["ecfp_dim"],
             "n_classes": n_classes,
-            "feature_set": "minimol+ecfp" if cfg.use_ecfp else "minimol",
+            "arch": "two_tower",
+            "feature_set": (
+                f"minimol+ecfp_r{cfg.ecfp_radius}" if cfg.use_ecfp else "minimol"
+            ),
             "norm_stats": norm_stats,
             "task": "dual",
             "epoch": cfg.epochs - 1,

@@ -1,19 +1,25 @@
-# Bayesian hyperparameter sweep for the dual-head pProp MLP.
+# Bayesian hyperparameter sweep for the TWO-TOWER dual-head pProp MLP
+# (MiniMol + ECFP, branch: minimol-ecfp-twotower).
 #
-# Objective: maximize val/goal_metric = 3 * macro_ap_obj + pearson_weighted - weighted_mae
-# at the FINAL training epoch (macro_ap_obj = macro AP over OBJECTIVE_CLASSES, 7.5+
-# excluded). No early stopping -- the model saved is always the one after the last
-# training step.
+# MiniMol and ECFP are each projected separately (Linear->LN->ReLU) then
+# concatenated into the shared trunk (model.TwoTowerDualHeadMLP; see
+# docs/ecfp_concat.md). This sweep explores the two projection widths and the
+# ECFP Morgan radius.
 #
-# Create + launch:
+# Objective: maximize val/goal_metric (definition lives in sweep_train.py's
+# log_dict) at the FINAL training epoch. No early stopping -- the model saved is
+# always the one after the last training step.
+#
+# Create + launch (ECFP caches MUST be precomputed for every swept radius first):
+#   .venv/bin/python src/featurize_ecfp.py --radii 2 3 4
 #   .venv/bin/wandb sweep sweeps/sweep.yaml          # prints a SWEEP_ID
 #   sbatch launch_sweep.sh SWEEP_ID=<id>
 # Or run agents manually (one per GPU):
-#   CUDA_VISIBLE_DEVICES=0 .venv/bin/wandb agent <ENTITY>/pprop-mlp-minimol-multitask/<SWEEP_ID>
+#   CUDA_VISIBLE_DEVICES=0 .venv/bin/wandb agent <ENTITY>/pprop-mlp-minimol-ecfp-twotower/<SWEEP_ID>
 
 program: src/sweep_train.py
 method: bayes
-project: pprop-mlp-minimol-multitask
+project: pprop-mlp-minimol-ecfp-twotower
 
 metric:
   name: val/goal_metric
@@ -26,16 +32,34 @@ command:
   - ${args}
 
 parameters:
-  # --- input features ---
-  # 0 = MiniMol only (512-d); 1 = concat cached ECFP (2048-d) -> 2560-d input.
-  #
-  # PIN THIS -- do not restore `values: [0, 1]`. The two feature sets need
-  # different hyperparameters (notably weight_decay), which a single bayes
-  # posterior cannot express: it under-samples the ECFP arm long before finding
-  # the region ECFP needs. Compare the feature sets with TWO separate sweeps of
-  # equal budget, one pinned [0] and one pinned [1]. See docs/ecfp_concat.md.
+  # --- input features (two-tower MiniMol + ECFP) ---
+  # This branch is the ECFP arm: use_ecfp is PINNED to 1. (use_ecfp=0 degenerates
+  # to a single MiniMol tower; run it as a separate pinned [0] sweep if you want
+  # that baseline -- do NOT restore `values: [0, 1]`, per docs/ecfp_concat.md the
+  # two feature sets need different hyperparameters a single bayes posterior can't
+  # express.)
   use_ecfp:
-    values: [0]   # arm 1: MiniMol only. Arm 2 = [1], as a SEPARATE sweep.
+    values: [1]
+
+  # Morgan radius of the precomputed ECFP cache (src/featurize_ecfp.py). Swept as
+  # a categorical -- the architecture is identical across radii (always an
+  # nbits-wide input -> projected), so one bayes posterior is fine. EVERY listed
+  # radius must have a precomputed cache before launch.
+  ecfp_radius:
+    values: [2, 3, 4]
+  ecfp_nbits:
+    value: 2048
+
+  # Per-tower projection widths (independent, not a common width -- lets the sweep
+  # explore unequal MiniMol vs ECFP capacity).
+  proj_dim_minimol:
+    distribution: q_log_uniform_values
+    min: 64
+    max: 1024
+  proj_dim_ecfp:
+    distribution: q_log_uniform_values
+    min: 64
+    max: 1024
 
   # --- regression target normalization (train-set stats) ---
   # none = raw pProp; zscore = (x-mean)/std; minmax = (x-min)/max. Eval
