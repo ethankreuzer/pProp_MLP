@@ -29,6 +29,11 @@ from make_splits import (
 N_CLASSES = len(CLASS_NAMES)
 CLASS_TO_IDX = {nm: i for i, nm in enumerate(CLASS_NAMES)}
 
+# ECFP (Morgan) fingerprint block reused from make_splits' cache. make_splits
+# writes mol_fps_r{radius}_b{n_bits}.npy as bit-PACKED uint8 (n_bits//8 cols),
+# aligned to raw-CSV row order; we unpack + dedup to the unique-molecule set.
+FP_RADIUS, FP_NBITS = 2, 2048
+
 
 def _canonicalize(smiles):
     """Canonical SMILES for a list of raw SMILES (None where unparseable)."""
@@ -49,7 +54,7 @@ def load_unique_molecules(csv_path=DATA_CSV):
     Returns a DataFrame with columns:
         canon       canonical SMILES (one row per unique molecule)
         pprop       pProp of the max-pProp copy
-        class_name  pProp class name (e.g. "5.5-6.5")
+        class_name  pProp class name (e.g. "5-7.5")
         class_idx   integer class label 0..N_CLASSES-1
     """
     df = pd.read_csv(csv_path)
@@ -92,6 +97,52 @@ def load_unique_molecules(csv_path=DATA_CSV):
     )
 
 
+def load_ecfp_features(radius=FP_RADIUS, n_bits=FP_NBITS):
+    """
+    ECFP feature block aligned to unique molecules, reusing make_splits' cache.
+
+    make_splits already computed and cached the Morgan fingerprints (bit-packed,
+    aligned to raw-CSV row order) in mol_fps_r{radius}_b{n_bits}.npy, alongside
+    the canonical SMILES (scaffolds.pkl "canon" column) and a validity mask
+    (valid.npy). We reuse those directly instead of recomputing: dedup to unique
+    canonical SMILES (first occurrence -- duplicate rows share an identical FP),
+    then unpack to a dense (M, n_bits) float32 matrix.
+
+    Returns (features, smiles_index): features[i] is the ECFP of smiles_index[i],
+    the same (matrix, aligned-canonical-SMILES) shape build_split_arrays expects
+    for MiniMol, so it can be passed straight through as an extra feature block.
+    """
+    fps_path = CACHE_DIR / f"mol_fps_r{radius}_b{n_bits}.npy"
+    scaff_path = CACHE_DIR / "scaffolds.pkl"
+    valid_path = CACHE_DIR / "valid.npy"
+    for p in (fps_path, scaff_path, valid_path):
+        if not p.exists():
+            raise FileNotFoundError(
+                f"{p} not found; ECFP features reuse make_splits' cache. Run "
+                "`.venv/bin/python src/make_splits.py ...` (or --figures-only) "
+                "at least once to populate data/cache/."
+            )
+
+    packed = np.load(fps_path)                 # (R, n_bits//8) uint8, CSV-row order
+    valid = np.load(valid_path)                # (R,) bool
+    canon = pd.read_pickle(scaff_path)["canon"].to_numpy()  # (R,) canonical SMILES
+    if not (len(packed) == len(valid) == len(canon)):
+        raise ValueError(
+            f"ECFP cache row mismatch: fps={len(packed)}, valid={len(valid)}, "
+            f"scaffolds={len(canon)}. Recompute with make_splits --force."
+        )
+
+    dedup = (
+        pd.DataFrame({"canon": canon, "row": np.arange(len(canon)), "valid": valid})
+        .query("valid and canon == canon")     # drop invalid + NaN canon
+        .drop_duplicates("canon", keep="first")
+    )
+    rows = dedup["row"].to_numpy()
+    smiles_index = dedup["canon"].tolist()
+    features = np.unpackbits(packed[rows], axis=1)[:, :n_bits].astype(np.float32)
+    return features, smiles_index
+
+
 def read_smi(path):
     """Read a .smi file (one SMILES per line) -> list[str]."""
     lines = Path(path).read_text().splitlines()
@@ -99,7 +150,7 @@ def read_smi(path):
 
 
 def build_split_arrays(split_dir, embeddings, smiles_index, verify_meta=True,
-                       return_pprop=False):
+                       return_pprop=False, extra_features=None):
     """
     Assemble (X, y) embedding/label arrays for a split's train and val sets.
 
@@ -112,6 +163,11 @@ def build_split_arrays(split_dir, embeddings, smiles_index, verify_meta=True,
     verify_meta : if True, assert per-class val counts match split_meta.json
     return_pprop : if True, also return pprop_train / pprop_val (continuous pProp
                    values needed as MSE regression targets)
+    extra_features : optional list of (features, smiles_index) blocks (e.g. ECFP
+                   from load_ecfp_features) column-concatenated onto MiniMol,
+                   aligned per molecule by canonical SMILES. A molecule missing
+                   from any block is dropped (counted as missing), so X columns
+                   are [MiniMol | block_0 | block_1 | ...] with rows all present.
 
     Returns dict with X_train, y_train, X_val, y_val (numpy) and the class names.
     If return_pprop=True, also includes pprop_train and pprop_val (float64).
@@ -122,23 +178,36 @@ def build_split_arrays(split_dir, embeddings, smiles_index, verify_meta=True,
     pprop_of = dict(zip(labels["canon"], labels["pprop"]))
     row_of = {smi: i for i, smi in enumerate(smiles_index)}
 
+    extra = list(extra_features or [])
+    extra_row_of = [{smi: i for i, smi in enumerate(si)} for (_, si) in extra]
+
     def gather(smi_file):
         smis = read_smi(split_dir / smi_file)
         rows, ys, pprops, missing = [], [], [], 0
+        extra_rows = [[] for _ in extra]
         for smi in smis:
-            if smi in row_of and smi in label_of:
+            if (smi in row_of and smi in label_of
+                    and all(smi in er for er in extra_row_of)):
                 rows.append(row_of[smi])
                 ys.append(label_of[smi])
                 pprops.append(pprop_of[smi])
+                for k, er in enumerate(extra_row_of):
+                    extra_rows[k].append(er[smi])
             else:
                 missing += 1
         if missing:
             raise KeyError(
-                f"{missing} SMILES in {smi_file} lack an embedding or label; "
-                "re-run featurize_minimol.py on the current molecule set."
+                f"{missing} SMILES in {smi_file} lack an embedding, label, or "
+                "extra feature; re-run featurize_minimol.py (and, for ECFP, "
+                "make_splits) on the current molecule set."
             )
         idx = np.asarray(rows)
-        return embeddings[idx], np.asarray(ys, dtype=np.int64), np.asarray(pprops, dtype=np.float64)
+        X = embeddings[idx]
+        if extra:
+            blocks = [X] + [feats[np.asarray(extra_rows[k])]
+                            for k, (feats, _) in enumerate(extra)]
+            X = np.concatenate(blocks, axis=1)
+        return X, np.asarray(ys, dtype=np.int64), np.asarray(pprops, dtype=np.float64)
 
     X_train, y_train, pprop_train = gather("train.smi")
     X_val, y_val, pprop_val = gather("val.smi")

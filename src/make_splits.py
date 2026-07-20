@@ -8,12 +8,12 @@ Produces `n` independent train/val splits, each in its own directory
 Goal
 ----
 A validation set that (a) SPANS EVERY pProp class and (b) keeps every val
-molecule's max ECFP Tanimoto to any train molecule <= --ceiling (default 0.70)
+molecule's max ECFP Tanimoto to any train molecule <= --ceiling (default 0.65)
 wherever that is feasible, relaxing the ceiling ONLY for the high-pProp classes
 that are too tightly clustered to hold out cleanly.
 
 pProp = log10(N / docking_rank) (rank 1 -> pProp ~9.17), high pProp = rare elite
-binder. Classes: [0,4.5) [4.5,5.5) [5.5,6.5) [6.5,7) [7,7.5) [7.5,inf).
+binder. Classes: [0,3.5) [3.5,5) [5,7.5) [7.5,inf).
 
 How the ceiling is guaranteed
 -----------------------------
@@ -25,14 +25,15 @@ held-out component is guaranteed <= ceiling to train.
 
 Assembly (per split, with a per-split RNG seed)
 -----------------------------------------------
-  * Per-class target = --val-frac of each class (so val mirrors the class mix).
+  * Per-class target from VAL_TARGETS (a fraction of the class, or an absolute
+    count -- 7.5+ is held out as a fixed 35 molecules).
   * Greedily hold out whole small components (size <= --max-unit-frac * N),
     scarce-class first, until each class hits its target. Components larger than
     the cap (the percolating giant) stay in train. This is the clean path.
   * BEST-EFFORT fallback: if some class still can't reach its target from clean
     components, move that class's least-train-similar leftover molecules into
     val until the target is met. These MAY exceed the ceiling; they are marked
-    and reported per class. (Not triggered at the default 12.5% target.)
+    and reported per class. (Not triggered at the VAL_TARGETS defaults.)
   * Every split is brute-force verified on GPU: max val->train Tanimoto per
     class, and the count of molecules over the ceiling.
 
@@ -66,8 +67,40 @@ DATA_CSV = PROJ / "data" / "ampc_subset.csv"
 CACHE_DIR = PROJ / "data" / "cache"
 SPLITS_PARENT = PROJ / "data"
 
-CLASS_EDGES = [(-np.inf, 4.5), (4.5, 5.5), (5.5, 6.5), (6.5, 7.0), (7.0, 7.5), (7.5, np.inf)]
-CLASS_NAMES = ["0-4.5", "4.5-5.5", "5.5-6.5", "6.5-7", "7-7.5", "7.5+"]
+CLASS_EDGES = [(-np.inf, 3.5), (3.5, 5.0), (5.0, 7.5), (7.5, np.inf)]
+CLASS_NAMES = ["0-3.5", "3.5-5", "5-7.5", "7.5+"]
+
+# Loss-weighting groups (class index -> group id). Plain inverse *class* frequency
+# would give the 46 "7.5+" molecules the largest weight, but those are ARTIFACTS
+# (high pProp, null hit-rate) — the class we care about LEAST. So 7.5+ shares the
+# null-hit-rate group with 0-3.5, and weights are derived from inverse *group*
+# frequency: 7.5+ inherits the null-class floor while 5-7.5 (the class of interest)
+# becomes the top-weighted class. See CLAUDE.md "Loss".
+WEIGHT_GROUPS = [0, 1, 2, 0]
+# Classes that steer the sweep objective's macro-AP. 7.5+ is still scored and its
+# per-class AP reported, but excluded from model selection (it's an artifact class).
+OBJECTIVE_CLASSES = ["0-3.5", "3.5-5", "5-7.5"]
+
+# Per-class validation target. A value < 1 is a FRACTION of that class; a value
+# >= 1 is an ABSOLUTE molecule count.
+#
+# 5-7.5 is 12% rather than 15% because it cannot reach 15% cleanly at ceiling
+# 0.65: 11,563 of its 13,778 molecules (83.9%) sit inside the >0.65 graph's
+# giant component (140,904 = 22.6% of N) and must stay in train, leaving only
+# 1,842 (13.37%) holdoutable. 12% (1,653) keeps headroom under that hard cap.
+# 7.5+ is an absolute 35 of 46 (all 46 are in small components at 0.65).
+VAL_TARGETS = {"0-3.5": 0.15, "3.5-5": 0.15, "5-7.5": 0.12, "7.5+": 35}
+
+
+def resolve_val_targets(classes):
+    """Per-class val targets as absolute counts, from the VAL_TARGETS spec."""
+    targets = {}
+    for nm in CLASS_NAMES:
+        n_cls = int((classes == nm).sum())
+        spec = VAL_TARGETS[nm]
+        want = int(spec) if spec >= 1 else int(round(spec * n_cls))
+        targets[nm] = min(want, n_cls)
+    return targets
 
 
 def pprop_class(pprop):
@@ -221,15 +254,13 @@ def build_components(packed_v, ceiling, device, row_block, force):
 # ---------------------------------------------------------------------------
 # Step 4a: stratified clean holdout of whole components
 # ---------------------------------------------------------------------------
-def assemble_clean(labels, classes, val_frac, max_unit_frac, rng):
-    """Hold out whole small components, scarce-class first, to reach a per-class
-    target of val_frac * |class|. Returns (split array, val_count, targets)."""
+def assemble_clean(labels, classes, targets, max_unit_frac, rng):
+    """Hold out whole small components, scarce-class first, to reach each class's
+    target (see VAL_TARGETS). Returns (split array, val_count, targets)."""
     n = len(labels)
     n_comp = int(labels.max()) + 1
     sizes = np.bincount(labels, minlength=n_comp)
     cap = max(int(max_unit_frac * n), 1)
-
-    targets = {nm: int(round(val_frac * int((classes == nm).sum()))) for nm in CLASS_NAMES}
 
     # members per component (small ones only)
     order = np.argsort(labels, kind="stable")
@@ -249,7 +280,7 @@ def assemble_clean(labels, classes, val_frac, max_unit_frac, rng):
 
     val_count = {nm: 0 for nm in CLASS_NAMES}
     chosen = set()
-    for nm in reversed(CLASS_NAMES):                      # scarce (7.5+) -> abundant (0-4.5)
+    for nm in reversed(CLASS_NAMES):                      # scarce (7.5+) -> abundant (0-3.5)
         for cid in by_class[nm]:
             if val_count[nm] >= targets[nm]:
                 break
@@ -339,7 +370,7 @@ def verify_split(packed_v, split, device, row_block):
 
 
 # ---------------------------------------------------------------------------
-# Figures: 8 PNGs per split (val->train similarity for all + 6 classes; counts)
+# Figures: one PNG per class + an "all" panel + class counts (6 at 4 classes)
 # ---------------------------------------------------------------------------
 def _sim_hist(ax, arr, title, ceiling):
     """Histogram of per-val-molecule max Tanimoto to train on `ax`."""
@@ -369,7 +400,7 @@ def _sim_hist(ax, arr, title, ceiling):
 
 
 def generate_figures(out_dir, ceiling=None):
-    """Read out_dir/clusters.csv and write the 8 PNGs for that split."""
+    """Read out_dir/clusters.csv and write that split's PNGs."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -421,7 +452,7 @@ def generate_figures(out_dir, ceiling=None):
     fig.tight_layout()
     fig.savefig(out_dir / "val_class_counts.png", dpi=150)
     plt.close(fig)
-    print(f"    wrote 8 figures -> {out_dir}")
+    print(f"    wrote {len(CLASS_NAMES) + 2} figures -> {out_dir}")
 
 
 def next_split_index(parent, prefix="split_"):
@@ -446,10 +477,8 @@ def main():
     ap.add_argument("--csv", type=str, default=None)
     ap.add_argument("--cache-dir", type=str, default=None)
     ap.add_argument("--out-parent", type=str, default=None)
-    ap.add_argument("--ceiling", type=float, default=0.70,
+    ap.add_argument("--ceiling", type=float, default=0.65,
                     help="target max Tanimoto of a val molecule to train (guaranteed where feasible)")
-    ap.add_argument("--val-frac", type=float, default=0.125,
-                    help="fraction of EACH class held out to val")
     ap.add_argument("--max-unit-frac", type=float, default=0.005,
                     help="components larger than this fraction of N stay in train")
     ap.add_argument("--radius", type=int, default=2)
@@ -522,7 +551,10 @@ def main():
     print(f"\n[2/3] Similarity components (ceiling={args.ceiling:g})")
     labels = build_components(packed_v, args.ceiling, device, args.row_block, args.force)
 
-    print(f"\n[3/3] Generating {args.n} split(s)  (val {args.val_frac:.1%} per class)")
+    val_targets = resolve_val_targets(classes_v)
+    print(f"\n[3/3] Generating {args.n} split(s)")
+    print("  per-class val targets: "
+          + ", ".join(f"{nm}={val_targets[nm]:,}" for nm in CLASS_NAMES))
     for _ in range(args.n):
         i = next_split_index(SPLITS_PARENT)
         seed = args.seed + i
@@ -530,7 +562,7 @@ def main():
         print(f"\n  split_{i}  (seed={seed})")
 
         split, val_count, targets = assemble_clean(
-            labels, classes_v, args.val_frac, args.max_unit_frac, rng,
+            labels, classes_v, dict(val_targets), args.max_unit_frac, rng,
         )
         relaxed = best_effort_topup(
             split, packed_v, classes_v, val_count, targets, device, args.row_block, rng,
@@ -577,7 +609,8 @@ def main():
             "split_index": i, "seed": seed,
             "n_train": int((split == "train").sum()), "n_val": n_val,
             "val_frac_realized": n_val / n_total,
-            "ceiling": args.ceiling, "val_frac_target": args.val_frac,
+            "ceiling": args.ceiling, "val_targets": val_targets,
+            "val_targets_spec": VAL_TARGETS,
             "max_unit_frac": args.max_unit_frac,
             "overall_max_val_to_train": worst,
             "n_val_over_ceiling": total_over,

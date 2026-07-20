@@ -1,26 +1,24 @@
-# Bayesian hyperparameter sweep for the pProp MLP classifier.
+# Bayesian hyperparameter sweep for the dual-head pProp MLP.
 #
-# Objective: maximize the BEST validation MACRO average precision achieved during
-# a run (best epoch, not the last) -- the unweighted mean AP across all 6 pProp
-# classes, so rare high-pProp classes count equally. sweep_train.py logs it as
-# `best_val_macro_ap` (running max); weighted AP is still tracked for reference.
+# Objective: maximize val/goal_metric = 3 * macro_ap_obj + pearson_weighted - weighted_mae
+# at the FINAL training epoch (macro_ap_obj = macro AP over OBJECTIVE_CLASSES, 7.5+
+# excluded). No early stopping -- the model saved is always the one after the last
+# training step.
 #
 # Create + launch:
 #   .venv/bin/wandb sweep sweeps/sweep.yaml          # prints a SWEEP_ID
-#   .venv/bin/wandb agent <ENTITY>/pprop-mlp-minimol/<SWEEP_ID>
-# Run several agents (one per GPU) by exporting CUDA_VISIBLE_DEVICES before each.
-#
-# The ranges below are deliberately broad placeholders -- tune them later.
+#   sbatch launch_sweep.sh SWEEP_ID=<id>
+# Or run agents manually (one per GPU):
+#   CUDA_VISIBLE_DEVICES=0 .venv/bin/wandb agent <ENTITY>/pprop-mlp-minimol-multitask/<SWEEP_ID>
 
 program: src/sweep_train.py
 method: bayes
-project: pprop-mlp-minimol
+project: pprop-mlp-minimol-multitask
 
 metric:
-  name: best_val_macro_ap
+  name: val/goal_metric
   goal: maximize
 
-# Use the project venv's python and forward sweep params as CLI args.
 command:
   - ${env}
   - /home/ethan2/pProp_MLP/.venv/bin/python
@@ -28,41 +26,92 @@ command:
   - ${args}
 
 parameters:
-  # --- tuned hyperparameters (broad placeholder ranges) ---
+  # --- input features ---
+  # 0 = MiniMol only (512-d); 1 = concat cached ECFP (2048-d) -> 2560-d input.
+  #
+  # PIN THIS -- do not restore `values: [0, 1]`. The two feature sets need
+  # different hyperparameters (notably weight_decay), which a single bayes
+  # posterior cannot express: it under-samples the ECFP arm long before finding
+  # the region ECFP needs. Compare the feature sets with TWO separate sweeps of
+  # equal budget, one pinned [0] and one pinned [1]. See docs/ecfp_concat.md.
+  use_ecfp:
+    values: [0]   # arm 1: MiniMol only. Arm 2 = [1], as a SEPARATE sweep.
+
+  # --- regression target normalization (train-set stats) ---
+  # none = raw pProp; zscore = (x-mean)/std; minmax = (x-min)/max. Eval
+  # denormalizes predictions before metrics, so goal_metric stays comparable
+  # across all three. Pin to a subset (e.g. [zscore, minmax]) to drop the baseline.
+  pprop_norm:
+    values: [none, zscore]
+
+  # --- shared trunk ---thin
   n_layers:
-    values: [1, 2, 3, 4, 5]
+    values: [1, 2, 3, 4]
   hidden_dim:
     distribution: q_log_uniform_values
-    min: 16
-    max: 512
+    min: 512
+    max: 2048
+
+  # --- classification head ---
+  cls_n_layers:
+    values: [0, 1, 2, 3]
+  cls_hidden_dim:
+    distribution: q_log_uniform_values
+    min: 124
+    max: 1024
+
+  # --- regression head ---
+  reg_n_layers:
+    values: [0, 1, 2, 3]  # 0 = no hidden layers, just a linear output layer
+  reg_hidden_dim:
+    distribution: q_log_uniform_values
+    min: 124
+    max: 1024 # 0 = no hidden layers, just a linear output layer
+    
+
+  # --- loss balance: total = w_cls*cls + huber + w_pair*pair + w_std*std ---
+  # Huber weight is fixed at 1 (the only term anchoring the absolute pProp level).
+  w_cls:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 1
+  w_pair:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 10
+  w_std:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 1.0
+  huber_delta:
+    distribution: log_uniform_values
+    min: 0.1
+    max: 5
+
+  # --- optimizer ---
   init_lr:
     distribution: log_uniform_values
-    min: 0.00001
-    max: 0.01
+    min: 0.00005
+    max: 0.003
   weight_decay:
     distribution: log_uniform_values
-    min: 0.00001
-    max: 0.05
+    min: 0.000001
+    max: 0.1
   dropout:
     distribution: uniform
     min: 0.0
     max: 0.5
   batch_size:
     distribution: q_log_uniform_values
-    min: 2
-    max: 128
+    min: 1000
+    max: 10000
   epochs:
     distribution: q_log_uniform_values
-    min: 10
-    max: 150
+    min: 20
+    max: 100
 
-  # Loss is always weighted cross-entropy with inverse-class-frequency weights
-  # (computed from the train split); no loss hyperparameters to sweep.
-
-  # --- constants (recorded with every run) ---
+  # --- constants recorded with every run ---
   split_dir:
-    value: data/split_3
-  patience:
-    value: 40
+    value: data/split_1
   eta_min:
     value: 0.00000001   # cosine schedule floor = 1e-8

@@ -38,8 +38,12 @@ def to_numpy(x):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--batch-size", type=int, default=2048,
-                    help="SMILES per MiniMol call.")
+    ap.add_argument("--batch-size", type=int, default=4096,
+                    help="SMILES per MiniMol call (also MiniMol's internal "
+                    "batch size). Throughput plateaus around 4096-8192; the "
+                    "featurizer is CPU-bound (RDKit/graph construction), not "
+                    "GPU-bound, so raising this (not parallelizing processes) "
+                    "is the effective speed knob.")
     ap.add_argument("--force", action="store_true",
                     help="Recompute even if the cache exists.")
     args = ap.parse_args()
@@ -57,7 +61,7 @@ def main():
     from minimol import Minimol
 
     print("Loading MiniMol ...")
-    featurizer = Minimol()
+    featurizer = Minimol(batch_size=args.batch_size)
 
     vecs = []
     n = len(smiles)
