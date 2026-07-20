@@ -28,7 +28,7 @@ set -e
 
 ENTITY="${WANDB_ENTITY:-ethan_personal}"
 PROJECT="pprop-mlp-minimol-ecfp-twotower"
-SWEEP_ID="${SWEEP_ID:-REPLACE_ME}"   # <-- replace with ID from `wandb sweep`
+SWEEP_ID="${SWEEP_ID:-5ntekn13}"   # <-- replace with ID from `wandb sweep`
 
 echo "SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID  CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"

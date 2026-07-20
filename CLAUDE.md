@@ -67,6 +67,22 @@ needed): `docs/ecfp_concat.md`.
 > `minimol_dim`/`ecfp_dim`/`proj_dim_*`, and `load_checkpoint` dispatches on that tag.
 > **Precompute every swept radius before launching** (`src/featurize_ecfp.py --radii
 > 2 3 4`), or runs sampling a missing radius crash at load.
+>
+> **Memory design (so 5 agents still fit per A6000 at `--gres=mps:20`).** The 2048-d
+> ECFP block ~5×'d the per-run GPU footprint vs MiniMol-only, causing OOMs. Two fixes:
+> (1) **`forward()` takes MiniMol and ECFP as *separate* tensors** — `model(x_minimol,
+> x_ecfp)` — and the ECFP block lives resident on the GPU as **uint8** (binary → the
+> per-batch `.float()` upcast in the ECFP tower is lossless), 4× smaller than fp32.
+> `load_data` returns `X_train`/`X_val` (MiniMol f32) plus `E_train`/`E_val` (ECFP
+> uint8, or `None` when `use_ecfp=0`). (2) **`evaluate()`/`get_preds()` chunk the
+> full-set forward** (`forward_full`, `EVAL_CHUNK`) so activation memory is per-chunk,
+> not O(N·width) — metrics stay exact, not subsampled. Net: resident ~6.4→2.6 GB; the
+> full-set eval spike is gone (~3 GB), so the binding per-run peak is now the training
+> step (~7 GB at the widest/deepest config with `batch_size=10000`, measured). 5 agents
+> fit per 47.5 GB A6000 at `--gres=mps:20` (~42 GB even if all 5 max out at once).
+> **Note:** the two-tensor `forward` signature is a breaking
+> change for any external caller (e.g. `sweeps/eval_best_model.ipynb`) that still does
+> `model(X)` on a concatenated tensor.
 
 **Optional target normalization.** `--pprop_norm {none,zscore,minmax}` (default
 `none`) makes the **regression head predict a normalized pProp** instead of raw

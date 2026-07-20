@@ -155,19 +155,34 @@ def load_data(split_dir, device, use_ecfp=False, ecfp_radius=2, ecfp_nbits=2048)
     data = build_split_arrays(split_dir, embeddings, smiles_index,
                               return_pprop=True, extra_features=extra_features)
 
-    in_dim = data["X_train"].shape[1]
+    # build_split_arrays returns X = [MiniMol | ECFP] (float32). Split the two
+    # blocks so the ECFP block can live on the GPU as uint8: it is binary, so the
+    # cast is lossless, and it shrinks the resident copy 4x (2048 f32 -> 2048 u8).
+    # The ECFP tower upcasts each batch back to float32 (model.TwoTowerDualHeadMLP).
     t = lambda a, dt: torch.as_tensor(a, dtype=dt, device=device)
+    Xm_train = data["X_train"][:, :minimol_dim]
+    Xm_val = data["X_val"][:, :minimol_dim]
+    if use_ecfp:
+        E_train = t(data["X_train"][:, minimol_dim:].astype(np.uint8), torch.uint8)
+        E_val = t(data["X_val"][:, minimol_dim:].astype(np.uint8), torch.uint8)
+        ecfp_dim = data["X_train"].shape[1] - minimol_dim
+    else:
+        E_train = E_val = None
+        ecfp_dim = 0
+
     return {
-        "X_train": t(data["X_train"], torch.float32),
+        "X_train": t(Xm_train, torch.float32),
+        "E_train": E_train,
         "y_train": t(data["y_train"], torch.long),
         "pprop_train": t(data["pprop_train"], torch.float32),
-        "X_val": t(data["X_val"], torch.float32),
+        "X_val": t(Xm_val, torch.float32),
+        "E_val": E_val,
         "y_val": t(data["y_val"], torch.long),
         "pprop_val": t(data["pprop_val"], torch.float32),
         "class_names": data["class_names"],
-        "in_dim": in_dim,
+        "in_dim": minimol_dim + ecfp_dim,
         "minimol_dim": minimol_dim,
-        "ecfp_dim": in_dim - minimol_dim,
+        "ecfp_dim": ecfp_dim,
     }
 
 
@@ -193,11 +208,32 @@ def plot_confusion_matrix(y_true, y_pred, class_names, title):
     return fig
 
 
+# Full-set eval forwards the whole train/val set through the model. Doing it in
+# one call materializes O(N x width) activations (~10 GB at N=530k); chunking it
+# caps activations at O(chunk x width) and frees them between chunks, so the peak
+# is per-chunk. Only the small per-row OUTPUTS (logits N x C, reg N x 1) are kept
+# and concatenated. Metrics stay exact (this is not a subsample).
+EVAL_CHUNK = 16384
+
+
 @torch.no_grad()
-def get_preds(model, X):
-    """Return argmax class predictions from the classification head."""
+def forward_full(model, X, E, chunk=EVAL_CHUNK):
+    """Run model over the full set in chunks; return (cls_logits, reg_out) concatenated."""
     model.eval()
-    cls_logits, _ = model(X)
+    n = X.shape[0]
+    cls_parts, reg_parts = [], []
+    for s in range(0, n, chunk):
+        xe = E[s:s + chunk] if E is not None else None
+        cl, ro = model(X[s:s + chunk], xe)
+        cls_parts.append(cl)
+        reg_parts.append(ro)
+    return torch.cat(cls_parts, dim=0), torch.cat(reg_parts, dim=0)
+
+
+@torch.no_grad()
+def get_preds(model, X, E):
+    """Return argmax class predictions from the classification head."""
+    cls_logits, _ = forward_full(model, X, E)
     return cls_logits.argmax(dim=1).cpu().numpy()
 
 
@@ -208,7 +244,7 @@ PAIR_EVAL_K = 4096
 
 
 @torch.no_grad()
-def evaluate(model, X, y, pprop, class_weights, w_cls, w_pair, w_std,
+def evaluate(model, X, E, y, pprop, class_weights, w_cls, w_pair, w_std,
              huber_delta, class_names, device, norm_stats):
     """Full-set loss + classification metrics + per-class regression metrics.
 
@@ -216,9 +252,12 @@ def evaluate(model, X, y, pprop, class_weights, w_cls, w_pair, w_std,
     (huber/pair/std) are computed against the normalized `pprop` — matching what
     training optimizes — while the metrics (MAE, Pearson) are computed on the raw
     pProp scale by denormalizing the predictions. `pprop` is passed in raw.
+
+    X is the MiniMol block (float32); E is the ECFP block (uint8) or None. The
+    forward is chunked (forward_full) so activation memory stays per-chunk.
     """
     model.eval()
-    cls_logits, reg_out = model(X)
+    cls_logits, reg_out = forward_full(model, X, E)
     pred = reg_out.squeeze(-1)
     pprop_norm = normalize_pprop(pprop, norm_stats)
     cw = class_weights.to(device)
@@ -340,6 +379,7 @@ def main():
     class_names = data["class_names"]
     X_train, y_train, pprop_train = data["X_train"], data["y_train"], data["pprop_train"]
     X_val, y_val, pprop_val = data["X_val"], data["y_val"], data["pprop_val"]
+    E_train, E_val = data["E_train"], data["E_val"]   # ECFP blocks (uint8) or None
     n_classes = len(class_names)
 
     # Regression-target normalization: stats from TRAIN only. The head learns the
@@ -404,7 +444,8 @@ def main():
         for start in range(0, n_train, cfg.batch_size):
             idx = perm[start:start + cfg.batch_size]
             optimizer.zero_grad()
-            cls_logits, reg_out = model(X_train[idx])
+            e_idx = E_train[idx] if E_train is not None else None
+            cls_logits, reg_out = model(X_train[idx], e_idx)
             pred = reg_out.squeeze(-1)
             cls_loss = F.cross_entropy(cls_logits, y_train[idx], weight=class_weights_dev)
             sample_w = sample_weights_from_classes(y_train[idx], class_weights_dev)
@@ -418,10 +459,10 @@ def main():
             optimizer.step()
         scheduler.step()
 
-        train_m = evaluate(model, X_train, y_train, pprop_train, class_weights,
+        train_m = evaluate(model, X_train, E_train, y_train, pprop_train, class_weights,
                            cfg.w_cls, cfg.w_pair, cfg.w_std, cfg.huber_delta,
                            class_names, device, norm_stats)
-        val_m = evaluate(model, X_val, y_val, pprop_val, class_weights,
+        val_m = evaluate(model, X_val, E_val, y_val, pprop_val, class_weights,
                          cfg.w_cls, cfg.w_pair, cfg.w_std, cfg.huber_delta,
                          class_names, device, norm_stats)
 
@@ -459,8 +500,8 @@ def main():
     # Upload confusion matrices as static images (true = y-axis, predicted = x-axis).
     y_train_np = y_train.cpu().numpy()
     y_val_np = y_val.cpu().numpy()
-    train_preds = get_preds(model, X_train)
-    val_preds = get_preds(model, X_val)
+    train_preds = get_preds(model, X_train, E_train)
+    val_preds = get_preds(model, X_val, E_val)
     train_fig = plot_confusion_matrix(y_train_np, train_preds, class_names, "Train")
     val_fig = plot_confusion_matrix(y_val_np, val_preds, class_names, "Val")
     wandb.log({

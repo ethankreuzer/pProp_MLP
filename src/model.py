@@ -69,10 +69,11 @@ class TwoTowerDualHeadMLP(nn.Module):
     proj_dim_ecfp) -- deliberately NOT a single common width, so a sweep can explore
     unequal per-tower capacity.
 
-    forward() receives the concatenated [MiniMol | ECFP] block that
-    build_split_arrays already produces (width minimol_dim + ecfp_dim); the split
-    point is unambiguous because MiniMol is always the first block. If ecfp_dim == 0
-    (use_ecfp off) the model degenerates to a single MiniMol tower.
+    forward() takes the two blocks as SEPARATE tensors: x_minimol (float32) and
+    x_ecfp (may be a compact uint8 tensor, upcast to float32 inside the ECFP tower
+    per batch — the block is binary so this is lossless and keeps the resident copy
+    4x smaller). If ecfp_dim == 0 / x_ecfp is None (use_ecfp off) the model
+    degenerates to a single MiniMol tower.
     """
 
     def __init__(self, minimol_dim, ecfp_dim, proj_dim_minimol, proj_dim_ecfp,
@@ -111,12 +112,13 @@ class TwoTowerDualHeadMLP(nn.Module):
         self.cls_head = _make_head(trunk_out, cls_hidden_dim, cls_n_layers, n_classes, dropout)
         self.reg_head = _make_head(trunk_out, reg_hidden_dim, reg_n_layers, 1, dropout)
 
-    def forward(self, x):
-        m = x[:, :self.minimol_dim]
-        z = self.minimol_tower(m)
+    def forward(self, x_minimol, x_ecfp=None):
+        z = self.minimol_tower(x_minimol)
         if self.ecfp_tower is not None:
-            e = x[:, self.minimol_dim:self.minimol_dim + self.ecfp_dim]
-            z = torch.cat([z, self.ecfp_tower(e)], dim=1)
+            if x_ecfp is None:
+                raise ValueError("ecfp_tower is present but x_ecfp was not provided")
+            # x_ecfp may be uint8 (compact resident storage); upcast per batch.
+            z = torch.cat([z, self.ecfp_tower(x_ecfp.float())], dim=1)
         h = self.trunk(z)
         return self.cls_head(h), self.reg_head(h)
 
