@@ -76,7 +76,15 @@ needed): `docs/ecfp_concat.md`.
 > `load_data` returns `X_train`/`X_val` (MiniMol f32) plus `E_train`/`E_val` (ECFP
 > uint8, or `None` when `use_ecfp=0`). (2) **`evaluate()`/`get_preds()` chunk the
 > full-set forward** (`forward_full`, `EVAL_CHUNK`) so activation memory is per-chunk,
-> not O(N·width) — metrics stay exact, not subsampled. Net: resident ~6.4→2.6 GB; the
+> not O(N·width) — metrics stay exact, not subsampled.
+>
+> **Eval cadence (speed).** Full-set eval was ~half of each epoch, dominated by the
+> full-TRAIN eval (~6× the val set). Since the objective selects on VAL at the final
+> epoch (no early stopping), the loop now scores the **train set once (final epoch
+> only)** and the **val set every `VAL_EVAL_EVERY`=5 epochs + final** — train metrics
+> are logged exactly once, val curves are sparse, and the final epoch still logs both
+> so the summary/checkpoint keep the final-epoch objective. ~46% faster/run at 45
+> epochs. Net: resident ~6.4→2.6 GB; the
 > full-set eval spike is gone (~3 GB), so the binding per-run peak is now the training
 > step (~7 GB at the widest/deepest config with `batch_size=10000`, measured). 5 agents
 > fit per 47.5 GB A6000 at `--gres=mps:20` (~42 GB even if all 5 max out at once).

@@ -215,6 +215,13 @@ def plot_confusion_matrix(y_true, y_pred, class_names, title):
 # and concatenated. Metrics stay exact (this is not a subsample).
 EVAL_CHUNK = 16384
 
+# Eval cadence. The full-set eval is ~half of each epoch's wall time, and the
+# full-TRAIN eval is the bulk of that (~6x the val set). Train metrics are
+# monitoring-only -- the sweep objective selects on VAL at the final epoch, with
+# no early stopping -- so we score the train set exactly ONCE (final epoch) and
+# the val set every VAL_EVAL_EVERY epochs plus the final one.
+VAL_EVAL_EVERY = 5
+
 
 @torch.no_grad()
 def forward_full(model, X, E, chunk=EVAL_CHUNK):
@@ -436,7 +443,7 @@ def main():
     ckpt_path = run_dir / "final_model.pt"
 
     n_train = X_train.shape[0]
-    train_m = val_m = None
+    log = None
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -459,16 +466,22 @@ def main():
             optimizer.step()
         scheduler.step()
 
-        train_m = evaluate(model, X_train, E_train, y_train, pprop_train, class_weights,
-                           cfg.w_cls, cfg.w_pair, cfg.w_std, cfg.huber_delta,
-                           class_names, device, norm_stats)
-        val_m = evaluate(model, X_val, E_val, y_val, pprop_val, class_weights,
-                         cfg.w_cls, cfg.w_pair, cfg.w_std, cfg.huber_delta,
-                         class_names, device, norm_stats)
-
+        # Eval schedule (see VAL_EVAL_EVERY): val every VAL_EVAL_EVERY epochs + the
+        # final epoch; train only at the final epoch. The final epoch always scores
+        # both, so the run summary + saved checkpoint carry the objective's
+        # final-epoch val metrics, and train metrics are logged exactly once.
+        is_last = epoch == cfg.epochs - 1
         log = {"epoch": epoch, "lr": scheduler.get_last_lr()[0]}
-        log.update(log_dict("train", train_m, class_names))
-        log.update(log_dict("val", val_m, class_names))
+        if is_last or (epoch + 1) % VAL_EVAL_EVERY == 0:
+            val_m = evaluate(model, X_val, E_val, y_val, pprop_val, class_weights,
+                             cfg.w_cls, cfg.w_pair, cfg.w_std, cfg.huber_delta,
+                             class_names, device, norm_stats)
+            log.update(log_dict("val", val_m, class_names))
+        if is_last:
+            train_m = evaluate(model, X_train, E_train, y_train, pprop_train, class_weights,
+                               cfg.w_cls, cfg.w_pair, cfg.w_std, cfg.huber_delta,
+                               class_names, device, norm_stats)
+            log.update(log_dict("train", train_m, class_names))
         wandb.log(log)
 
     # Save final model (after all training steps complete).
